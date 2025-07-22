@@ -10,7 +10,7 @@ epsdk install GitHubParser
 ```
 
 ## 配置
-安装完毕后首次加载模块时，会自动创建一个名为 `GitHubParser` 的配置文件，配置文件内容如下：
+安装完毕后首次加载模块时，会自动创建一个名为 `GitHubParser` 的配置项 在项目的 `config.toml` 文件中，内容如下：
 
 ```toml
 [GitHubParser]
@@ -34,4 +34,4 @@ token = "" # GitHub API令牌（可选，可提高API速率限制）
    ```
 
 ## 参考链接
-- 主库：https://github.com/ErisPulse/ErisPulse
+- ErisPulse 主库：https://github.com/ErisPulse/ErisPulse

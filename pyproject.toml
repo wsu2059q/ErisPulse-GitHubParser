@@ -1,0 +1,17 @@
+[project]
+name = "ErisPulse-GitHubParser"
+version = "1.0.0"
+description = "GitHub链接解析模块，自动解析仓库/Issue/PR信息并以最佳格式展示"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { file = "LICENSE" }
+authors = [ { name = "wsu2059q", email = "wsu2059@qq.com" } ]
+
+dependencies = [
+]
+
+[project.urls]
+"homepage" = "https://github.com/wsu2059q/ErisPulse-GitHubParser"
+
+[project.entry-points."erispulse.module"]
+"GitHubParser" = "ErisPulse_GitHubParser:Main"

@@ -251,8 +251,7 @@ class GitHubParser:
                     
                 try:
                     # 使用链式调用发送消息
-                    sender = adapter_instance.Send.To(target_type, target_id)
-                    await getattr(sender, method_name)(content)
+                    getattr(adapter_instance.Send.To(target_type, target_id), method_name)(content)
                     return True
                 except Exception as e:
                     self.logger.error(f"使用{method_name}发送GitHub信息失败: {str(e)}")

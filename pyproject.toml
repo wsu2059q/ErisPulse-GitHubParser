@@ -1,6 +1,6 @@
 [project]
 name = "ErisPulse-GitHubParser"
-version = "1.0.0"
+version = "1.0.1"
 description = "GitHub链接解析模块，自动解析仓库/Issue/PR信息并以最佳格式展示"
 readme = "README.md"
 requires-python = ">=3.9"

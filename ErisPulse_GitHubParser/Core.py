@@ -9,7 +9,6 @@ class GitHubParser:
     def __init__(self):
         self.sdk = sdk
         self.logger = sdk.logger
-        self.util = sdk.util
         self.adapter = sdk.adapter
         
         # 配置正则表达式匹配GitHub URL

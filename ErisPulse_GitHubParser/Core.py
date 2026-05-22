@@ -838,7 +838,49 @@ class Main(BaseModule):
 
             max_count = self.config.get("max_urls_per_message", 3)
             for url in urls[:max_count]:
-                await self._send_github_info(event, url)
+                data = await self.parser.parse_github_url(url)
+                if not data:
+                    self.logger.warning(f"解析GitHub链接失败: {url}")
+                    continue
+
+                templates_set = GitHubTemplates.build_card(data, self.config)
+                platform = event.get_platform()
+                fmt_name, content = self._select_best_format(platform, templates_set)
+
+                try:
+                    await event.reply(content, method=fmt_name)
+                except Exception:
+                    try:
+                        await event.reply(templates_set["text"])
+                        fmt_name = "Text"
+                    except Exception as e:
+                        self.logger.error(f"发送GitHub卡片失败: {e}")
+                        continue
+
+                hint = GitHubTemplates._get_hint(data)
+                if not hint["has_detail"]:
+                    continue
+
+                self.logger.debug(f"等待用户回复查看详情, url={url}")
+                try:
+                    reply = await event.wait_reply(
+                        timeout=60,
+                        validator=lambda e: "看一下" in e.get_text(),
+                    )
+                except Exception as e:
+                    self.logger.error(f"wait_reply 异常: {type(e).__name__}: {e}")
+                    continue
+
+                if reply is None:
+                    self.logger.debug(f"wait_reply 超时或未通过验证, url={url}")
+                    continue
+
+                self.logger.info(f"收到详情查看请求, url={url}, text={reply.get_text()}")
+                detail = GitHubTemplates.build_detail(data)
+                if not detail:
+                    self.logger.warning(f"构建详情失败, url={url}")
+                    continue
+                await self._send_with_fallback(reply, detail, fmt_name)
 
     def _select_best_format(self, platform: str, templates: Dict[str, str]) -> tuple:
         try:
@@ -866,40 +908,3 @@ class Main(BaseModule):
             except Exception:
                 pass
         await event.reply(templates["text"])
-
-    async def _send_github_info(self, event, url: str):
-        data = await self.parser.parse_github_url(url)
-        if not data:
-            return
-
-        templates_set = GitHubTemplates.build_card(data, self.config)
-        platform = event.get_platform()
-        fmt_name, content = self._select_best_format(platform, templates_set)
-
-        try:
-            await event.reply(content, method=fmt_name)
-        except Exception:
-            try:
-                await event.reply(templates_set["text"])
-                fmt_name = "Text"
-            except Exception:
-                return
-
-        hint = GitHubTemplates._get_hint(data)
-        if not hint["has_detail"]:
-            return
-
-        async def on_detail_reply(reply_event):
-            text = reply_event.get_text().strip()
-            if "看一下" not in text:
-                return
-
-            detail = GitHubTemplates.build_detail(data)
-            if not detail:
-                return
-            await self._send_with_fallback(reply_event, detail, fmt_name)
-
-        await event.wait_reply(
-            timeout=60,
-            callback=on_detail_reply,
-        )

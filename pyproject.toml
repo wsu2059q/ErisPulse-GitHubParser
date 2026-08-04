@@ -1,4 +1,4 @@
-﻿[project]
+[project]
 name = "ErisPulse-GitHubParser"
 version = "3.0.0"
 description = "被动解析 GitHub 链接并渲染图片卡片（Takumi），文本自动降级"

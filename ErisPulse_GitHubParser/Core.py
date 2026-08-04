@@ -1,789 +1,80 @@
 import re
-import time
-import base64
-from typing import Optional, Dict, List, Tuple
+from typing import Any, Dict, Optional, Tuple
 
-import aiohttp
-
-from ErisPulse import sdk
+from ErisPulse import i18n, sdk
 from ErisPulse.Core.Bases import BaseModule
-from ErisPulse.Core.Event import message
-
-_GITHUB_LINK_REGEX = re.compile(
-    r'https?://(?:www\.)?github\.com/([^/\s]+)/([^/\s]+)/?(?:issues/(\d+)|pull/(\d+)|tree/([^/\s]+)|blob/([^/\s]+/[^/\s]+)|$)?'
-)
-
-_GITHUB_URL_REGEX = re.compile(r'https?://github\.com/[^\s]+')
-
-_MD_LINK_RE = re.compile(r'\[([^\]]*)\]\(([^)]+)\)')
-_MD_IMAGE_RE = re.compile(r'!\[([^\]]*)\]\(([^)]+)\)')
-
-
-def _format_count(n: int) -> str:
-    if n >= 10_000:
-        return f"{n / 10_000:.1f}w"
-    if n >= 1_000:
-        return f"{n / 1_000:.1f}k"
-    return str(n)
-
-
-def _resolve_relative_urls(text: str, owner: str, repo: str, branch: str) -> str:
-    raw_base = f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}"
-    blob_base = f"https://github.com/{owner}/{repo}/blob/{branch}"
-
-    def _make_abs(url: str, is_image: bool = False) -> str:
-        if not url or url.startswith(("http://", "https://", "mailto:", "#", "data:")):
-            return url
-        base = raw_base if is_image else blob_base
-        path = url.lstrip("./")
-        return f"{base}/{path}"
-
-    def _replace_image(m):
-        alt, url = m.group(1), m.group(2)
-        return f"![{alt}]({_make_abs(url, is_image=True)})"
-
-    def _replace_link(m):
-        text_inner, url = m.group(1), m.group(2)
-        return f"[{text_inner}]({_make_abs(url)})"
-
-    text = _MD_IMAGE_RE.sub(_replace_image, text)
-    text = _MD_LINK_RE.sub(_replace_link, text)
-    return text
-
-
-def _inline_md_to_html(text: str) -> str:
-    if not text:
-        return ""
-    text = _MD_IMAGE_RE.sub(
-        lambda m: f'<img src="{m.group(2)}" alt="{m.group(1)}" style="max-width:100%;border-radius:4px;">',
-        text
-    )
-    text = re.sub(r'`([^`]+)`', r'<code style="background:rgba(0,0,0,0.06);padding:1px 4px;border-radius:3px;font-size:12px;">\1</code>', text)
-    text = re.sub(r'\*\*(.+?)\*\*', r'<strong>\1</strong>', text)
-    text = re.sub(r'(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)', r'<em>\1</em>', text)
-    text = _MD_LINK_RE.sub(r'<a href="\2" style="color:#0969da;text-decoration:none;">\1</a>', text)
-    return text
-
-
-def _md_to_html(text: str) -> str:
-    if not text:
-        return ""
-    lines = text.split('\n')
-    html_parts = []
-    in_list = False
-    in_code_block = False
-
-    for line in lines:
-        stripped = line.strip()
-
-        if re.match(r'^</?(details|summary|table|thead|tbody|tr|th|td|thead|br|hr|img|a\s|div|p|blockquote|pre|code|strong|em|b|i|ul|ol|li|h[1-6])', stripped, re.IGNORECASE):
-            if in_list:
-                html_parts.append('</ul>')
-                in_list = False
-            html_parts.append(line)
-            continue
-
-        if stripped.startswith('```'):
-            if in_code_block:
-                html_parts.append('</code></pre>')
-                in_code_block = False
-            else:
-                if in_list:
-                    html_parts.append('</ul>')
-                    in_list = False
-                lang = stripped[3:].strip()
-                html_parts.append(f'<pre><code{f" class={lang}" if lang else ""}>')
-                in_code_block = True
-            continue
-
-        if in_code_block:
-            html_parts.append(_inline_md_to_html(line))
-            continue
-
-        if re.match(r'^---+\s*$', stripped):
-            if in_list:
-                html_parts.append('</ul>')
-                in_list = False
-            html_parts.append('<hr style="border:none;border-top:1px solid #e0e0e0;margin:8px 0;">')
-            continue
-
-        header_match = re.match(r'^(#{1,6})\s+(.+)$', stripped)
-        if header_match:
-            if in_list:
-                html_parts.append('</ul>')
-                in_list = False
-            level = len(header_match.group(1))
-            sizes = {1: '18px', 2: '16px', 3: '14px', 4: '13px', 5: '13px', 6: '12px'}
-            size = sizes.get(level, '13px')
-            content = _inline_md_to_html(header_match.group(2))
-            html_parts.append(f'<div style="font-size:{size};font-weight:bold;margin:8px 0 4px;">{content}</div>')
-            continue
-
-        if stripped.startswith('>'):
-            if in_list:
-                html_parts.append('</ul>')
-                in_list = False
-            quote_content = re.sub(r'^>\s*', '', stripped)
-            html_parts.append(f'<div style="border-left:3px solid #238636;padding:4px 8px;margin:4px 0;color:#555;font-size:13px;">{_inline_md_to_html(quote_content)}</div>')
-            continue
-
-        list_match = re.match(r'^(\s*)-\s+(.*)$', line)
-        if list_match:
-            indent = len(list_match.group(1))
-            content = _inline_md_to_html(list_match.group(2))
-            if not in_list:
-                html_parts.append('<ul style="margin:4px 0;padding-left:20px;">')
-                in_list = True
-            margin = f"margin-left:{indent * 8}px;" if indent > 0 else ""
-            html_parts.append(f'<li style="{margin}font-size:13px;margin-bottom:2px;">{content}</li>')
-            continue
-
-        if in_list:
-            html_parts.append('</ul>')
-            in_list = False
-
-        if not stripped:
-            html_parts.append('<div style="height:6px;"></div>')
-            continue
-
-        html_parts.append(f'<div style="font-size:13px;line-height:1.6;">{_inline_md_to_html(stripped)}</div>')
-
-    if in_list:
-        html_parts.append('</ul>')
-    if in_code_block:
-        html_parts.append('</code></pre>')
-
-    return '\n'.join(html_parts)
-
-
-class GitHubTemplates:
-    PRIMARY_COLOR = "#238636"
-    PRIMARY_BG = "rgba(35, 134, 54, 0.06)"
-    SECONDARY_COLOR = "#656d76"
-    ACCENT_COLOR = "#0969da"
-
-    _HINT_HTML = '<div style="font-size:12px;color:{color};margin-top:8px;">想{action}吗？说 <code style="background:rgba(0,0,0,0.06);padding:1px 4px;border-radius:3px;">看一下</code> 发送</div>'
-
-    @classmethod
-    def _get_hint(cls, data: dict) -> dict:
-        if data["type"] == "repository" and data.get("readme_content"):
-            return {
-                "action": "查看这个项目的 README",
-                "has_detail": True,
-            }
-        elif data["type"] == "issue" and data.get("issue_body"):
-            return {
-                "action": "查看这条 Issue 的详细内容和评论",
-                "has_detail": True,
-            }
-        elif data["type"] == "pull_request" and data.get("pr_body"):
-            return {
-                "action": "查看这条 PR 的详细内容和评论",
-                "has_detail": True,
-            }
-        return {"action": "", "has_detail": False}
-
-    @classmethod
-    def _hint_html(cls, data: dict) -> str:
-        hint = cls._get_hint(data)
-        if not hint["has_detail"]:
-            return ""
-        return cls._HINT_HTML.format(action=hint["action"], color=cls.SECONDARY_COLOR)
-
-    @classmethod
-    def _hint_md(cls, data: dict) -> Optional[str]:
-        hint = cls._get_hint(data)
-        if not hint["has_detail"]:
-            return None
-        return f'\n\n想{hint["action"]}吗？说 `看一下` 发送'
-
-    @classmethod
-    def _hint_text(cls, data: dict) -> Optional[str]:
-        hint = cls._get_hint(data)
-        if not hint["has_detail"]:
-            return None
-        return f'\n\n想{hint["action"]}吗？说 看一下 发送'
-
-    @classmethod
-    def build_card(cls, data: dict, config: dict) -> Dict[str, str]:
-        html_card = cls._build_html(data, config)
-        markdown_card = cls._build_markdown(data, config)
-        text_card = cls._build_text(data, config)
-        return {"html": html_card, "markdown": markdown_card, "text": text_card}
-
-    @classmethod
-    def _build_html(cls, data: dict, config: dict) -> str:
-        if data["type"] == "repository":
-            return cls._build_repo_html(data, config)
-        elif data["type"] == "issue":
-            return cls._build_issue_html(data, config)
-        elif data["type"] == "pull_request":
-            return cls._build_pr_html(data, config)
-        return ""
-
-    @classmethod
-    def _build_repo_html(cls, data: dict, config: dict) -> str:
-        stat_items = (
-            f'<span style="margin-right: 12px;">Stars: {_format_count(data["stars"])}</span>'
-            f'<span style="margin-right: 12px;">Forks: {_format_count(data["forks"])}</span>'
-            f'<span>Watchers: {_format_count(data["watchers"])}</span>'
-        )
-
-        info_items = []
-        if data.get("language") and data["language"] != "未知":
-            info_items.append(f'<span style="margin-right: 12px;">{data["language"]}</span>')
-        if data.get("license") and data["license"] != "无":
-            info_items.append(f'<span>{data["license"]}</span>')
-        info_line = "".join(info_items)
-
-        topics_line = ""
-        if config.get("show_topics", True) and data.get("topics"):
-            topics_html = " ".join(
-                f'<code style="font-size: 11px; background: rgba(35,134,54,0.08); padding: 1px 5px; border-radius: 3px;">{t}</code>'
-                for t in data["topics"][:8]
-            )
-            topics_line = f'<div style="font-size: 12px; margin-top: 6px;">{topics_html}</div>'
-
-        homepage_line = ""
-        if data.get("homepage"):
-            homepage_line = (
-                f'<div style="font-size: 12px; margin-top: 4px;">'
-                f'<a href="{data["homepage"]}" style="color: {cls.ACCENT_COLOR};">{data["homepage"]}</a>'
-                f'</div>'
-            )
-
-        return (
-            f'<div style="padding: 12px; border-radius: 8px;">'
-            f'<div style="font-size: 15px; font-weight: bold; margin-bottom: 8px;">'
-            f'<a href="{data["url"]}" style="color: {cls.PRIMARY_COLOR}; text-decoration: none;">{data["full_name"]}</a></div>'
-            f'<div style="font-size: 13px; color: {cls.SECONDARY_COLOR}; margin-bottom: 10px;">{data.get("description") or "暂无描述"}</div>'
-            f'<div style="padding: 8px; background: {cls.PRIMARY_BG}; border-radius: 6px; margin-bottom: 8px;">'
-            f'<div style="font-size: 13px; margin-bottom: 4px;">{stat_items}</div>'
-            f'<div style="font-size: 13px;">{info_line}</div>'
-            f'{topics_line}'
-            f'</div>'
-            f'{homepage_line}'
-            f'<div style="font-size: 11px; color: {cls.SECONDARY_COLOR};">创建于: {data["created_at"]} | 更新于: {data["updated_at"]}</div>'
-            f'{cls._hint_html(data)}'
-            f'</div>'
-        )
-
-    @classmethod
-    def _build_issue_html(cls, data: dict, config: dict) -> str:
-        state_color = "#1a7f37" if data["state"] == "开启" else "#cf222e"
-        return (
-            f'<div style="padding: 12px; border-radius: 8px;">'
-            f'<div style="font-size: 15px; font-weight: bold; margin-bottom: 8px;">'
-            f'<a href="{data["url"]}" style="color: {cls.PRIMARY_COLOR}; text-decoration: none;">Issue #{data["issue_number"]}</a></div>'
-            f'<div style="font-size: 13px; margin-bottom: 10px;">{data["title"]}</div>'
-            f'<div style="padding: 8px; background: {cls.PRIMARY_BG}; border-radius: 6px;">'
-            f'<span style="color: {state_color}; font-weight: bold;">{data["state"]}</span>'
-            f'<span style="margin-left: 12px; font-size: 13px;">作者: {data["user"]}</span>'
-            f'<span style="margin-left: 12px; font-size: 13px;">评论: {data["comments"]}</span>'
-            f'</div>'
-            f'<div style="font-size: 11px; color: {cls.SECONDARY_COLOR}; margin-top: 6px;">创建于: {data["created_at"]}</div>'
-            f'{cls._hint_html(data)}'
-            f'</div>'
-        )
-
-    @classmethod
-    def _build_pr_html(cls, data: dict, config: dict) -> str:
-        state_color = "#1a7f37" if data["state"] == "开启" else "#cf222e"
-        return (
-            f'<div style="padding: 12px; border-radius: 8px;">'
-            f'<div style="font-size: 15px; font-weight: bold; margin-bottom: 8px;">'
-            f'<a href="{data["url"]}" style="color: {cls.PRIMARY_COLOR}; text-decoration: none;">PR #{data["pr_number"]}</a></div>'
-            f'<div style="font-size: 13px; margin-bottom: 10px;">{data["title"]}</div>'
-            f'<div style="padding: 8px; background: {cls.PRIMARY_BG}; border-radius: 6px;">'
-            f'<span style="color: {state_color}; font-weight: bold;">{data["state"]}</span>'
-            f'<span style="margin-left: 12px; font-size: 13px;">作者: {data["user"]}</span>'
-            f'<span style="margin-left: 12px; font-size: 13px;">评论: {data["comments"]}</span>'
-            f'<span style="margin-left: 12px; font-size: 13px;">提交: {data["commits"]}</span>'
-            f'</div>'
-            f'<div style="font-size: 12px; margin-top: 6px; color: {cls.PRIMARY_COLOR};">'
-            f'+{data["additions"]} / -{data["deletions"]}</div>'
-            f'<div style="font-size: 11px; color: {cls.SECONDARY_COLOR}; margin-top: 4px;">创建于: {data["created_at"]}</div>'
-            f'{cls._hint_html(data)}'
-            f'</div>'
-        )
-
-    @classmethod
-    def _build_markdown(cls, data: dict, config: dict) -> str:
-        if data["type"] == "repository":
-            return cls._build_repo_markdown(data, config)
-        elif data["type"] == "issue":
-            return cls._build_issue_markdown(data, config)
-        elif data["type"] == "pull_request":
-            return cls._build_pr_markdown(data, config)
-        return ""
-
-    @classmethod
-    def _build_repo_markdown(cls, data: dict, config: dict) -> str:
-        lines = [
-            f'**[{data["full_name"]}]({data["url"]})**',
-            f'{data.get("description") or "暂无描述"}',
-            '',
-            f'Stars: {_format_count(data["stars"])} | '
-            f'Forks: {_format_count(data["forks"])} | '
-            f'Watchers: {_format_count(data["watchers"])}',
-        ]
-
-        info_parts = []
-        if data.get("language") and data["language"] != "未知":
-            info_parts.append(data["language"])
-        if data.get("license") and data["license"] != "无":
-            info_parts.append(data["license"])
-        if info_parts:
-            lines.append(' | '.join(info_parts))
-
-        if config.get("show_topics", True) and data.get("topics"):
-            lines.append(f'标签: {" | ".join(f"`{t}`" for t in data["topics"][:8])}')
-
-        if data.get("homepage"):
-            lines.append(f'[{data["homepage"]}]({data["homepage"]})')
-
-        lines.append(f'创建于: {data["created_at"]} | 更新于: {data["updated_at"]}')
-
-        hint = cls._hint_md(data)
-        if hint:
-            lines.append(hint)
-
-        return '\n'.join(lines)
-
-    @classmethod
-    def _build_issue_markdown(cls, data: dict, config: dict) -> str:
-        lines = [
-            f'**[Issue #{data["issue_number"]}]({data["url"]})** - {data["title"]}',
-            '',
-            f'状态: {data["state"]} | 作者: {data["user"]}',
-            f'评论: {data["comments"]} | 创建于: {data["created_at"]}',
-        ]
-
-        hint = cls._hint_md(data)
-        if hint:
-            lines.append(hint)
-
-        return '\n'.join(lines)
-
-    @classmethod
-    def _build_pr_markdown(cls, data: dict, config: dict) -> str:
-        lines = [
-            f'**[PR #{data["pr_number"]}]({data["url"]})** - {data["title"]}',
-            '',
-            f'状态: {data["state"]} | 作者: {data["user"]}',
-            f'评论: {data["comments"]} | 提交: {data["commits"]}',
-            f'+{data["additions"]} / -{data["deletions"]} 行 | 创建于: {data["created_at"]}',
-        ]
-
-        hint = cls._hint_md(data)
-        if hint:
-            lines.append(hint)
-
-        return '\n'.join(lines)
-
-    @classmethod
-    def _build_text(cls, data: dict, config: dict) -> str:
-        if data["type"] == "repository":
-            return cls._build_repo_text(data, config)
-        elif data["type"] == "issue":
-            return cls._build_issue_text(data, config)
-        elif data["type"] == "pull_request":
-            return cls._build_pr_text(data, config)
-        return data.get("url", "")
-
-    @classmethod
-    def _build_repo_text(cls, data: dict, config: dict) -> str:
-        lines = [
-            data["full_name"],
-            data.get("description") or "暂无描述",
-            '----------',
-            f'Stars: {_format_count(data["stars"])}  '
-            f'Forks: {_format_count(data["forks"])}  '
-            f'Watchers: {_format_count(data["watchers"])}',
-        ]
-
-        info_parts = []
-        if data.get("language") and data["language"] != "未知":
-            info_parts.append(f'语言: {data["language"]}')
-        if data.get("license") and data["license"] != "无":
-            info_parts.append(f'许可证: {data["license"]}')
-        if info_parts:
-            lines.append(' | '.join(info_parts))
-
-        if config.get("show_topics", True) and data.get("topics"):
-            lines.append(f'标签: {" | ".join(data["topics"][:8])}')
-
-        if data.get("homepage"):
-            lines.append(f'首页: {data["homepage"]}')
-
-        lines.append(f'创建于: {data["created_at"]} | 更新于: {data["updated_at"]}')
-        lines.append(f'{data["url"]}')
-
-        hint = cls._hint_text(data)
-        if hint:
-            lines.append(hint)
-
-        return '\n'.join(lines)
-
-    @classmethod
-    def _build_issue_text(cls, data: dict, config: dict) -> str:
-        lines = [
-            f'Issue #{data["issue_number"]} - {data["title"]}',
-            '----------',
-            f'状态: {data["state"]} | 作者: {data["user"]}',
-            f'评论: {data["comments"]} | 创建于: {data["created_at"]}',
-            data["url"],
-        ]
-
-        hint = cls._hint_text(data)
-        if hint:
-            lines.append(hint)
-
-        return '\n'.join(lines)
-
-    @classmethod
-    def _build_pr_text(cls, data: dict, config: dict) -> str:
-        lines = [
-            f'PR #{data["pr_number"]} - {data["title"]}',
-            '----------',
-            f'状态: {data["state"]} | 作者: {data["user"]}',
-            f'评论: {data["comments"]} | 提交: {data["commits"]}',
-            f'+{data["additions"]} / -{data["deletions"]}',
-            f'创建于: {data["created_at"]}',
-            data["url"],
-        ]
-
-        hint = cls._hint_text(data)
-        if hint:
-            lines.append(hint)
-
-        return '\n'.join(lines)
-
-    @classmethod
-    def _build_comment_text(cls, c: dict) -> str:
-        return f'{c["user"]}: {c["body"]}'
-
-    @classmethod
-    def _build_comment_md(cls, c: dict) -> str:
-        return f'**{c["user"]}**: {c["body"]}'
-
-    @classmethod
-    def _build_comment_html(cls, c: dict) -> str:
-        return (
-            f'<div style="margin-bottom:8px;padding:6px;background:rgba(35,134,54,0.03);border-radius:4px;">'
-            f'<span style="font-weight:bold;color:{cls.PRIMARY_COLOR};">{c["user"]}</span>'
-            f'<div style="font-size:13px;margin-top:2px;color:#333;">{_md_to_html(c["body"])}</div>'
-            f'</div>'
-        )
-
-    @classmethod
-    def build_detail(cls, data: dict) -> Dict[str, str]:
-        if data["type"] == "repository":
-            return cls._build_readme_detail(data)
-        elif data["type"] == "issue":
-            return cls._build_issue_detail(data)
-        elif data["type"] == "pull_request":
-            return cls._build_pr_detail(data)
-        return {}
-
-    @classmethod
-    def _build_readme_detail(cls, data: dict) -> Dict[str, str]:
-        return {
-            "html": (
-                f'<div style="padding:12px;border-radius:8px;">'
-                f'<div style="font-size:15px;font-weight:bold;margin-bottom:8px;color:{cls.PRIMARY_COLOR};">README</div>'
-                f'<div style="font-size:13px;line-height:1.6;">{data.get("readme_html", "")}</div>'
-                f'</div>'
-            ),
-            "markdown": "**README**\n\n" + '\n'.join(f'> {line}' for line in data.get("readme_content", "").split('\n')),
-            "text": f"── README ──\n\n{data.get('readme_content', '')}",
-        }
-
-    @classmethod
-    def _build_issue_detail(cls, data: dict) -> Dict[str, str]:
-        body = data.get("issue_body", "")
-        comments: List[dict] = data.get("issue_comments", [])
-
-        body_html = _md_to_html(body)
-        comments_html = ''.join(cls._build_comment_html(c) for c in comments)
-        comments_md = '\n'.join(cls._build_comment_md(c) for c in comments)
-        comments_text = '\n'.join(cls._build_comment_text(c) for c in comments)
-
-        return {
-            "html": (
-                f'<div style="padding:12px;border-radius:8px;">'
-                f'<div style="font-size:15px;font-weight:bold;margin-bottom:8px;color:{cls.PRIMARY_COLOR};">'
-                f'Issue #{data["issue_number"]}: {data["title"]}</div>'
-                f'<div style="font-size:13px;color:#333;margin-bottom:12px;line-height:1.6;">{body_html}</div>'
-                f'{comments_html}'
-                f'</div>'
-            ),
-            "markdown": (
-                f'**Issue #{data["issue_number"]}: {data["title"]}**\n\n'
-                f'{body}\n\n'
-                f'{"── 评论 ──" if comments else ""}\n{comments_md}'
-            ),
-            "text": (
-                f'Issue #{data["issue_number"]}: {data["title"]}\n'
-                f'{"─" * 20}\n\n'
-                f'{body}\n\n'
-                f'{"── 评论 ──" if comments else ""}\n{comments_text}'
-            ),
-        }
-
-    @classmethod
-    def _build_pr_detail(cls, data: dict) -> Dict[str, str]:
-        body = data.get("pr_body", "")
-        comments: List[dict] = data.get("pr_comments", [])
-
-        body_html = _md_to_html(body)
-        comments_html = ''.join(cls._build_comment_html(c) for c in comments)
-        comments_md = '\n'.join(cls._build_comment_md(c) for c in comments)
-        comments_text = '\n'.join(cls._build_comment_text(c) for c in comments)
-
-        return {
-            "html": (
-                f'<div style="padding:12px;border-radius:8px;">'
-                f'<div style="font-size:15px;font-weight:bold;margin-bottom:8px;color:{cls.PRIMARY_COLOR};">'
-                f'PR #{data["pr_number"]}: {data["title"]}</div>'
-                f'<div style="font-size:13px;color:#333;margin-bottom:12px;line-height:1.6;">{body_html}</div>'
-                f'{comments_html}'
-                f'</div>'
-            ),
-            "markdown": (
-                f'**PR #{data["pr_number"]}: {data["title"]}**\n\n'
-                f'{body}\n\n'
-                f'{"── 评论 ──" if comments else ""}\n{comments_md}'
-            ),
-            "text": (
-                f'PR #{data["pr_number"]}: {data["title"]}\n'
-                f'{"─" * 20}\n\n'
-                f'{body}\n\n'
-                f'{"── 评论 ──" if comments else ""}\n{comments_text}'
-            ),
-        }
-
-
-class GitHubParser:
-    def __init__(self, logger, config: dict):
-        self.logger = logger
-        self.config = config
-        self._cache: Dict[str, Tuple[dict, float]] = {}
-        self._cache_ttl = config.get("cache_ttl", 600)
-
-        gh_config = sdk.config.getConfig("GitHubParser") or {}
-        self.gh_token = gh_config.get("token", "")
-        if not self.gh_token:
-            sdk.config.setConfig("GitHubParser", {"token": ""})
-            self.logger.warning("未找到GitHub API令牌，你可以在你的配置文件填入token，或者你也可以不填")
-            self.gh_token = ""
-
-        self.headers = {"Authorization": f"token {self.gh_token}"} if self.gh_token else {}
-
-    def _get_cache(self, key: str) -> Optional[dict]:
-        if key in self._cache:
-            data, ts = self._cache[key]
-            if time.time() - ts < self._cache_ttl:
-                return data
-            del self._cache[key]
+from ErisPulse.Core.Event import command, message
+
+from .GitHubClient import GitHubClient, GitHubError
+from .I18n import register as _register_i18n
+from .TextTemplates import render_text
+from .Visualizer import Visualizer
+
+_GH_URL_FIND = re.compile(r'https?://(?:www\.)?github\.com/[A-Za-z0-9_.\-/]+')
+
+_GH_RESERVED = {
+    "settings", "orgs", "notifications", "search", "explore", "trending",
+    "topics", "collections", "events", "about", "pricing", "security",
+    "contact", "login", "join", "features", "enterprise", "sponsors",
+    "marketplace", "pulls", "issues", "stars", "new", "import", "gist",
+    "sessions", "team", "organizations", "opensource", "resources",
+    "customer-stories", "site-resources", "secure-open-source", "blog",
+}
+
+
+def _parse_gh_url(url: str) -> Optional[Tuple[str, str, str, Any]]:
+    url = url.split("#", 1)[0].split("?", 1)[0].rstrip(").,;]")
+    m = re.match(r'https?://(?:www\.)?github\.com/(.+)', url)
+    if not m:
         return None
-
-    def _set_cache(self, key: str, data: dict):
-        self._cache[key] = (data, time.time())
-        now = time.time()
-        expired = [k for k, (_, ts) in self._cache.items() if now - ts > self._cache_ttl]
-        for k in expired:
-            del self._cache[k]
-
-    async def _fetch_github_data(self, url: str) -> Optional[Dict]:
-        try:
-            async with aiohttp.ClientSession(headers=self.headers) as session:
-                async with session.get(url) as response:
-                    if response.status == 200:
-                        data = await response.json()
-                        if not isinstance(data, dict):
-                            self.logger.error(f"GitHub API返回无效数据类型: {type(data)}")
-                            return None
-                        return data
-                    elif response.status == 404:
-                        self.logger.warning(f"GitHub资源不存在: {url}")
-                    else:
-                        self.logger.error(f"GitHub API请求失败: {response.status}")
-        except Exception as e:
-            self.logger.error(f"获取GitHub数据时出错: {str(e)}")
+    path = m.group(1).strip("/")
+    if not path:
         return None
+    parts = path.split("/")
+    owner = parts[0]
+    if owner.lower() in _GH_RESERVED:
+        return None
+    if len(parts) == 1:
+        return ("user", owner, "", "")
+    repo = parts[1]
+    if not repo or repo.lower() in _GH_RESERVED:
+        return None
+    if len(parts) == 2:
+        return ("repo", owner, repo, "")
+    sub = parts[2].lower()
+    if sub == "issues" and len(parts) >= 4 and parts[3].isdigit():
+        return ("issue", owner, repo, int(parts[3]))
+    if sub in ("pull", "pulls") and len(parts) >= 4 and parts[3].isdigit():
+        return ("pr", owner, repo, int(parts[3]))
+    if sub in ("commit", "commits"):
+        return ("commits", owner, repo, "")
+    return ("repo", owner, repo, "")
 
-    async def _fetch_github_list(self, url: str) -> List[Dict]:
-        try:
-            async with aiohttp.ClientSession(headers=self.headers) as session:
-                async with session.get(url) as response:
-                    if response.status == 200:
-                        data = await response.json()
-                        if isinstance(data, list):
-                            return data
-                    return []
-        except Exception:
-            return []
 
-    def _format_date(self, date_str: str) -> str:
-        if not date_str:
-            return "未知"
-        from datetime import datetime
-        dt = datetime.strptime(date_str, "%Y-%m-%dT%H:%M:%SZ")
-        return dt.strftime("%Y年%m月%d日")
+def _split_owner_repo(target: str) -> Tuple[str, str]:
+    target = (target or "").strip().lstrip("@").rstrip("/")
+    if "/" in target:
+        owner, repo = target.split("/", 1)
+        return owner.strip(), repo.strip()
+    return target, ""
 
-    async def _fetch_readme(self, owner: str, repo: str, branch: str) -> Optional[Dict]:
-        readme_url = f"https://api.github.com/repos/{owner}/{repo}/readme"
-        data = await self._fetch_github_data(readme_url)
-        if not data or "content" not in data:
-            return None
 
-        try:
-            content = base64.b64decode(data["content"]).decode("utf-8", errors="replace")
-            resolved = _resolve_relative_urls(content, owner, repo, branch)
-
-            return {
-                "raw": resolved,
-                "html": _md_to_html(resolved),
-            }
-        except Exception as e:
-            self.logger.debug(f"解析README内容失败: {e}")
-            return None
-
-    async def _fetch_issue_comments(self, owner: str, repo: str, issue_num: str) -> List[dict]:
-        url = f"https://api.github.com/repos/{owner}/{repo}/issues/{issue_num}/comments"
-        raw = await self._fetch_github_list(url)
-        return [
-            {
-                "user": c.get("user", {}).get("login", "未知用户"),
-                "body": c.get("body", ""),
-            }
-            for c in raw
-        ]
-
-    async def _fetch_pr_comments(self, owner: str, repo: str, pr_num: str) -> List[dict]:
-        review_url = f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_num}/comments"
-        issue_url = f"https://api.github.com/repos/{owner}/{repo}/issues/{pr_num}/comments"
-        review_raw = await self._fetch_github_list(review_url)
-        issue_raw = await self._fetch_github_list(issue_url)
-
-        seen = set()
-        comments = []
-        for c in review_raw + issue_raw:
-            login = c.get("user", {}).get("login", "未知用户")
-            body = c.get("body", "")
-            key = (login, body)
-            if key not in seen:
-                seen.add(key)
-                comments.append({"user": login, "body": body})
-        return comments
-
-    async def parse_github_url(self, url: str) -> Optional[Dict]:
-        cached = self._get_cache(url)
-        if cached:
-            return cached
-
-        try:
-            match = _GITHUB_LINK_REGEX.match(url)
-            if not match:
-                return None
-
-            owner, repo, issue_num, pr_num, branch, blob_path = match.groups()
-
-            result = {
-                "type": "repository",
-                "url": url,
-                "owner": owner,
-                "repo": repo,
-                "full_name": f"{owner}/{repo}",
-                "api_url": f"https://api.github.com/repos/{owner}/{repo}",
-                "is_issue": issue_num is not None,
-                "is_pr": pr_num is not None,
-                "is_branch": branch is not None,
-                "is_blob": blob_path is not None,
-            }
-
-            repo_data = await self._fetch_github_data(result["api_url"])
-            if repo_data is None:
-                self.logger.warning(f"获取仓库信息失败: {result['api_url']}")
-                return None
-
-            default_branch = repo_data.get("default_branch", "main")
-
-            result.update({
-                "description": repo_data.get("description") if repo_data.get("description") is not None else "",
-                "stars": repo_data.get("stargazers_count", 0),
-                "forks": repo_data.get("forks_count", 0),
-                "watchers": repo_data.get("watchers_count", 0),
-                "language": repo_data.get("language", "未知"),
-                "license": repo_data.get("license", {}).get("name", "无") if repo_data.get("license") is not None else "无",
-                "created_at": self._format_date(repo_data.get("created_at", "")),
-                "updated_at": self._format_date(repo_data.get("updated_at", "")),
-                "homepage": repo_data.get("homepage", ""),
-                "topics": repo_data.get("topics", []),
-                "default_branch": default_branch,
-            })
-
-            if issue_num:
-                issue_url = f"{result['api_url']}/issues/{issue_num}"
-                issue_data = await self._fetch_github_data(issue_url)
-                if issue_data is None:
-                    self.logger.warning(f"获取issue信息失败: {issue_url}")
-                    return None
-
-                result.update({
-                    "type": "issue",
-                    "issue_number": issue_num,
-                    "title": issue_data.get("title", ""),
-                    "state": "开启" if issue_data.get("state") == "open" else "关闭",
-                    "user": issue_data.get("user", {}).get("login", "未知用户") if issue_data.get("user") is not None else "未知用户",
-                    "comments": issue_data.get("comments", 0),
-                    "issue_body": issue_data.get("body", ""),
-                    "created_at": self._format_date(issue_data.get("created_at", "")),
-                    "updated_at": self._format_date(issue_data.get("updated_at", "")),
-                    "closed_at": self._format_date(issue_data.get("closed_at", "")),
-                })
-
-                result["issue_comments"] = await self._fetch_issue_comments(owner, repo, issue_num)
-
-            elif pr_num:
-                pr_url = f"{result['api_url']}/pulls/{pr_num}"
-                pr_data = await self._fetch_github_data(pr_url)
-                if pr_data is None:
-                    self.logger.warning(f"获取PR信息失败: {pr_url}")
-                    return None
-
-                result.update({
-                    "type": "pull_request",
-                    "pr_number": pr_num,
-                    "title": pr_data.get("title", ""),
-                    "state": "开启" if pr_data.get("state") == "open" else "关闭",
-                    "user": pr_data.get("user", {}).get("login", "未知用户") if pr_data.get("user") is not None else "未知用户",
-                    "comments": pr_data.get("comments", 0),
-                    "commits": pr_data.get("commits", 0),
-                    "additions": pr_data.get("additions", 0),
-                    "deletions": pr_data.get("deletions", 0),
-                    "changed_files": pr_data.get("changed_files", 0),
-                    "pr_body": pr_data.get("body", ""),
-                    "created_at": self._format_date(pr_data.get("created_at", "")),
-                    "updated_at": self._format_date(pr_data.get("updated_at", "")),
-                    "closed_at": self._format_date(pr_data.get("closed_at", "")),
-                    "merged_at": self._format_date(pr_data.get("merged_at", "")),
-                })
-
-                result["pr_comments"] = await self._fetch_pr_comments(owner, repo, pr_num)
-
-            if result["type"] == "repository" and self.config.get("show_readme", True):
-                readme = await self._fetch_readme(owner, repo, default_branch)
-                if readme:
-                    result["readme_content"] = readme["raw"]
-                    result["readme_html"] = readme["html"]
-
-            self._set_cache(url, result)
-            return result
-        except Exception as e:
-            self.logger.error(f"解析GitHub URL时出错: {str(e)}")
-            return None
+_DEFAULT_CONFIG: Dict[str, Any] = {
+    "enabled": True,
+    "token": "",
+    "theme": "auto",
+    "utc_offset": 8,
+    "auto_parse": True,
+    "auto_parse_max": 3,
+    "image_enabled": True,
+    "show_topics": True,
+    "avatar_enabled": True,
+    "issue_comments": True,
+    "issue_comments_max": 3,
+    "comment_max_len": 120,
+    "cache_ttl": 600,
+    "lang": "auto",
+}
 
 
 class Main(BaseModule):
@@ -791,120 +82,333 @@ class Main(BaseModule):
         self.sdk = sdk
         self.logger = sdk.logger.get_child("GitHubParser")
         self.config = self._load_config()
-        self.parser = GitHubParser(self.logger, self.config)
+        self._client: Optional[GitHubClient] = None
+        self._viz: Optional[Visualizer] = None
 
     @staticmethod
     def get_load_strategy():
         from ErisPulse.loaders import ModuleLoadStrategy
-        return ModuleLoadStrategy(
-            lazy_load=False,
-            priority=0,
-        )
+        return ModuleLoadStrategy(lazy_load=False, priority=0)
 
-    def _load_config(self) -> dict:
+    def _t(self, key: str, default: str = "", **kw) -> str:
+        return i18n.t(key, default=default, **kw)
+
+    def _load_config(self) -> Dict[str, Any]:
         config = sdk.config.getConfig("GitHubParser")
         if not config or not isinstance(config, dict):
-            default_config = {
-                "show_readme": True,
-                "cache_ttl": 600,
-                "show_topics": True,
-                "max_urls_per_message": 3,
-            }
-            sdk.config.setConfig("GitHubParser", default_config, immediate=True)
-            self.logger.info("已创建默认配置")
-            return default_config
+            sdk.config.setConfig("GitHubParser", dict(_DEFAULT_CONFIG), immediate=True)
+            self.logger.info("已写入 GitHubParser 默认配置")
+            return dict(_DEFAULT_CONFIG)
+        changed = False
+        for k, v in _DEFAULT_CONFIG.items():
+            if k not in config:
+                config[k] = v
+                changed = True
+        if changed:
+            sdk.config.setConfig("GitHubParser", config, immediate=True)
         return config
 
-    async def on_load(self, event):
-        self._register_auto_parse()
-        self.logger.info("GitHub解析模块已加载")
+    def _resolve_lang(self) -> str:
+        cfg_lang = (self.config.get("lang") or "auto").strip()
+        if cfg_lang == "auto":
+            try:
+                cur = i18n.get_language() or ""
+            except Exception:
+                cur = ""
+            if isinstance(cur, str) and cur:
+                return cur if not cur.startswith("en") else "en"
+            return "zh-CN"
+        return cfg_lang
 
-    async def on_unload(self, event):
-        self.logger.info("GitHub解析模块已卸载")
+    async def on_load(self, event) -> bool:
+        _register_i18n(i18n)
+        self._client = GitHubClient(
+            token=self.config.get("token", ""),
+            cache_ttl=self.config.get("cache_ttl", 600),
+        )
+        self.config["lang"] = self._resolve_lang()
+        self._viz = Visualizer(self.sdk, self.config)
+        self._register_passive()
+        self._register_commands()
+        self._register_routes()
+        self.logger.info(self._t(
+            "ghparser.loaded", "GitHubParser loaded",
+            auto=str(self.config.get("auto_parse")),
+            image=str(self.config.get("image_enabled")),
+            token=self._t("ghparser.token_yes") if self.config.get("token") else self._t("ghparser.token_no"),
+        ))
+        return True
 
-    def _register_auto_parse(self):
+    async def on_unload(self, event) -> bool:
+        self._unregister_routes()
+        self.logger.info(self._t("ghparser.unloaded", "GitHubParser unloaded"))
+        return True
+
+    def _register_passive(self):
+        if not self.config.get("auto_parse", True):
+            self.logger.info(self._t("ghparser.passive_skip", "passive off"))
+            return
+
         @message.on_message(priority=50)
-        async def auto_parse_handler(event):
+        async def on_message(event):
             if event.is_command():
                 return
-
-            text = event.get_text()
-            if not text:
+            text = event.get_text() or ""
+            if "github.com" not in text:
                 return
-
-            urls = _GITHUB_URL_REGEX.findall(text)
+            urls = _GH_URL_FIND.findall(text)
             if not urls:
                 return
-
-            max_count = self.config.get("max_urls_per_message", 3)
-            for url in urls[:max_count]:
-                data = await self.parser.parse_github_url(url)
-                if not data:
-                    self.logger.warning(f"解析GitHub链接失败: {url}")
+            seen = set()
+            uniq = []
+            for u in urls:
+                if u not in seen:
+                    seen.add(u)
+                    uniq.append(u)
+            max_n = max(1, min(5, int(self.config.get("auto_parse_max", 3))))
+            for url in uniq[:max_n]:
+                parsed = _parse_gh_url(url)
+                if not parsed:
                     continue
-
-                templates_set = GitHubTemplates.build_card(data, self.config)
-                platform = event.get_platform()
-                fmt_name, content = self._select_best_format(platform, templates_set)
-
                 try:
-                    await event.reply(content, method=fmt_name)
-                except Exception:
-                    try:
-                        await event.reply(templates_set["text"])
-                        fmt_name = "Text"
-                    except Exception as e:
-                        self.logger.error(f"发送GitHub卡片失败: {e}")
-                        continue
-
-                hint = GitHubTemplates._get_hint(data)
-                if not hint["has_detail"]:
-                    continue
-
-                self.logger.debug(f"等待用户回复查看详情, url={url}")
-                try:
-                    reply = await event.wait_reply(
-                        timeout=60,
-                        validator=lambda e: "看一下" in e.get_text(),
-                    )
+                    await self._dispatch(event, parsed, passive=True)
+                except GitHubError as e:
+                    self.logger.debug(f"被动解析失败 {url}: {e}")
                 except Exception as e:
-                    self.logger.error(f"wait_reply 异常: {type(e).__name__}: {e}")
-                    continue
+                    self.logger.warning(f"被动解析异常 {url}: {e}")
 
-                if reply is None:
-                    self.logger.debug(f"wait_reply 超时或未通过验证, url={url}")
-                    continue
-
-                self.logger.info(f"收到详情查看请求, url={url}, text={reply.get_text()}")
-                detail = GitHubTemplates.build_detail(data)
-                if not detail:
-                    self.logger.warning(f"构建详情失败, url={url}")
-                    continue
-                await self._send_with_fallback(reply, detail, fmt_name)
-
-    def _select_best_format(self, platform: str, templates: Dict[str, str]) -> tuple:
-        try:
-            supported_methods = sdk.adapter.list_sends(platform)
-            if "Html" in supported_methods:
-                return ("Html", templates["html"])
-            elif "Markdown" in supported_methods:
-                return ("Markdown", templates["markdown"])
+    def _register_commands(self):
+        @command("gh", help="GitHubParser：状态 / 开关 / 额度 / 手动卡片")
+        async def gh_cmd(event):
+            args = event.get_command_args() or []
+            sub = args[0].lower() if args else ""
+            if sub in ("on", "enable"):
+                await self._set_toggle(event, "auto_parse", True,
+                                       self._t("ghparser.auto_on"))
+            elif sub in ("off", "disable"):
+                await self._set_toggle(event, "auto_parse", False,
+                                       self._t("ghparser.auto_off"))
+            elif sub == "toggle":
+                cur = self.config.get("auto_parse", True)
+                state = self._t("ghparser.toggle_on") if not cur else self._t("ghparser.toggle_off")
+                await self._set_toggle(event, "auto_parse", not cur,
+                                       self._t("ghparser.auto_toggled", state=state))
+            elif sub == "image":
+                if len(args) < 2:
+                    st = self._t("ghparser.toggle_on") if self.config.get("image_enabled") else self._t("ghparser.toggle_off")
+                    await event.reply(self._t("ghparser.image_status", state=st))
+                    return
+                val = args[1].lower() in ("on", "1", "true", "yes")
+                await self._set_toggle(
+                    event, "image_enabled", val,
+                    self._t("ghparser.image_on") if val else self._t("ghparser.image_off"))
+            elif sub == "rate":
+                await self._cmd_rate(event)
+            elif sub == "heat":
+                rest = args[1:]
+                if not rest:
+                    await event.reply(self._t("ghparser.usage_heat"))
+                    return
+                await self._dispatch(event, ("heat", " ".join(rest), "", ""), passive=False)
+            elif sub in ("langs", "languages"):
+                owner, repo = _split_owner_repo(" ".join(args[1:]))
+                if not owner or not repo:
+                    await event.reply(self._t("ghparser.usage_langs"))
+                    return
+                await self._dispatch(event, ("langs", owner, repo, ""), passive=False)
             else:
-                return ("Text", templates["text"])
-        except Exception:
-            return ("Text", templates["text"])
+                await event.reply(self._status_text())
 
-    async def _send_with_fallback(self, event, templates: Dict[str, str], fmt_name: str):
-        if fmt_name == "Html":
+    async def _set_toggle(self, event, key: str, value: bool, msg: str):
+        self.config[key] = value
+        try:
+            sdk.config.setConfig("GitHubParser", self.config, immediate=True)
+        except Exception as e:
+            self.logger.warning(f"保存配置失败: {e}")
+        await event.reply(self._t("ghparser.saved", msg=msg, default=msg))
+
+    async def _cmd_rate(self, event):
+        try:
+            info = await self._client.rate_limit()
+        except Exception as e:
+            await event.reply(self._t("ghparser.rate_fail", err=str(e)))
+            return
+        if not info.get("available"):
+            await event.reply(self._t("ghparser.rate_unavailable"))
+            return
+        reset = (info.get("reset_at") or "?").replace("T", " ").replace("Z", "")
+        token_line = (self._t("ghparser.rate_token_on") if info.get("has_token")
+                      else self._t("ghparser.rate_token_off"))
+        await event.reply("\n".join([
+            self._t("ghparser.rate_title"),
+            self._t("ghparser.rate_line", remaining=info["remaining"], limit=info["limit"], used=info["used"]),
+            self._t("ghparser.rate_reset", reset=reset),
+            token_line,
+        ]))
+
+    def _status_text(self) -> str:
+        on = self._t("ghparser.toggle_on")
+        off = self._t("ghparser.toggle_off")
+        return self._t(
+            "ghparser.help",
+            auto=(on if self.config.get("auto_parse") else off),
+            image=(on if self.config.get("image_enabled") else off),
+            token=(self._t("ghparser.token_yes") if self.config.get("token") else self._t("ghparser.token_no")),
+            theme=self.config.get("theme", "auto"),
+        )
+
+    async def _card_bytes(self, kind, owner, repo, number):
+        self.config["lang"] = self._resolve_lang()
+        data = await self._fetch(kind, owner, repo, number)
+        avatar = None
+        if kind == "user" and self.config.get("avatar_enabled", True):
             try:
-                await event.reply(templates["html"], method="Html")
-                return
-            except Exception:
-                pass
-        if fmt_name in ("Html", "Markdown"):
+                avatar = await self._client.fetch_avatar_data_uri(data.get("avatar_url", ""))
+            except Exception as e:
+                self.logger.debug(self._t("ghparser.avatar_fail", err=str(e)))
+        png = None
+        if self.config.get("image_enabled", True):
+            png = self._render_image(kind, owner, repo, data, avatar)
+        return data, png
+
+    async def _dispatch(self, event, parsed, passive: bool):
+        kind, owner, repo, number = parsed
+        try:
+            data, png = await self._card_bytes(kind, owner, repo, number)
+        except GitHubError as e:
+            if passive:
+                if e.kind in ("rate_limit", "not_found", "auth", "network", "forbidden", "invalid"):
+                    await event.reply(self._error_msg(e))
+                else:
+                    self.logger.warning(f"被动解析失败 {kind} {owner}/{repo}/{number}: {e}")
+            else:
+                await event.reply(self._error_msg(e))
+            return
+
+        if png is not None:
             try:
-                await event.reply(templates["markdown"], method="Markdown")
+                await event.reply(png, method="Image")
                 return
-            except Exception:
-                pass
-        await event.reply(templates["text"])
+            except Exception as e:
+                self.logger.warning(self._t("ghparser.send_fail_log", err=str(e)))
+
+        await event.reply(render_text(kind, owner, repo, number, data, self.config["lang"]))
+
+    def _register_routes(self):
+        r = self.sdk.router
+        r.register_http_route("GitHubParser", "/", handler=self._api_info, methods=["GET"])
+        r.register_http_route("GitHubParser", "/status", handler=self._api_status, methods=["GET"])
+        r.register_http_route("GitHubParser", "/rate", handler=self._api_rate, methods=["GET"])
+        r.register_http_route("GitHubParser", "/card", handler=self._api_card, methods=["GET"])
+
+    def _unregister_routes(self):
+        try:
+            r = self.sdk.router
+            for p in ["/", "/status", "/rate", "/card"]:
+                try:
+                    r.unregister_http_route("GitHubParser", p)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    async def _api_info(self, request):
+        return {
+            "module": "GitHubParser",
+            "description": "Passive GitHub link parsing with Takumi card images",
+            "endpoints": ["/", "/status", "/rate", "/card?url=<github-link>"],
+        }
+
+    async def _api_status(self, request):
+        return {
+            "passive": bool(self.config.get("auto_parse")),
+            "image": bool(self.config.get("image_enabled")),
+            "token": bool(self.config.get("token")),
+            "theme": self.config.get("theme", "auto"),
+            "lang": self.config["lang"],
+        }
+
+    async def _api_rate(self, request):
+        from fastapi.responses import JSONResponse
+        try:
+            return JSONResponse(await self._client.rate_limit())
+        except Exception as e:
+            return JSONResponse({"available": False, "error": str(e)}, status_code=500)
+
+    async def _api_card(self, request):
+        from fastapi.responses import JSONResponse, Response
+        url = (request.query_params.get("url") or "").strip()
+        parsed = _parse_gh_url(url) if url else None
+        if not parsed:
+            return JSONResponse({"ok": False, "error": "无法识别的 GitHub 链接，示例: ?url=https://github.com/o/r/issues/1"}, status_code=400)
+        kind, owner, repo, number = parsed
+        try:
+            _, png = await self._card_bytes(kind, owner, repo, number)
+        except GitHubError as e:
+            return JSONResponse({"ok": False, "error": self._error_msg(e)})
+        except Exception as e:
+            self.logger.error(f"card API 异常: {e}", exc_info=True)
+            return JSONResponse({"ok": False, "error": f"渲染异常: {e}"}, status_code=500)
+        if png is None:
+            return JSONResponse({"ok": False, "error": "图片不可用（Takumi 未安装或已关闭图片输出）"}, status_code=503)
+        return Response(content=png, media_type="image/png")
+
+    async def _fetch(self, kind, owner, repo, number):
+        c = self._client
+        if kind == "user":
+            data = await c.get_user(owner)
+        elif kind == "repo":
+            data = await c.get_repo(owner, repo)
+        elif kind == "issue":
+            data = await c.get_issue(owner, repo, number)
+        elif kind == "pr":
+            data = await c.get_pr(owner, repo, number)
+        elif kind == "commits":
+            data = await c.get_commits(owner, repo, 5)
+        elif kind == "langs":
+            data = await c.get_languages(owner, repo)
+        elif kind == "heat":
+            data = await c.get_contributions(owner)
+        else:
+            raise GitHubError(f"未知类型: {kind}", kind="invalid")
+        if kind in ("issue", "pr") and self.config.get("issue_comments", True):
+            try:
+                data = dict(data)
+                data["comments_list"] = await c.get_issue_comments(
+                    owner, repo, number, self.config.get("issue_comments_max", 3))
+            except GitHubError as e:
+                self.logger.debug(f"评论获取失败 {owner}/{repo}#{number}: {e}")
+        return data
+
+    def _render_image(self, kind, owner, repo, data, avatar=None):
+        v = self._viz
+        try:
+            if kind == "user":
+                return v.render_user(data, avatar)
+            if kind == "repo":
+                return v.render_repo(data, self.config.get("show_topics", True))
+            if kind == "issue":
+                return v.render_issue(f"{owner}/{repo}", data)
+            if kind == "pr":
+                return v.render_pr(f"{owner}/{repo}", data)
+            if kind == "commits":
+                return v.render_commits(f"{owner}/{repo}", data)
+            if kind == "langs":
+                return v.render_languages(f"{owner}/{repo}", data)
+            if kind == "heat":
+                return v.render_heatmap(owner, data)
+        except Exception as e:
+            self.logger.warning(self._t("ghparser.render_fail", kind=kind, err=str(e)))
+        return None
+
+    def _error_msg(self, e: GitHubError) -> str:
+        msg = str(e)
+        if e.kind == "not_found":
+            return self._t("ghparser.err_not_found", msg=msg)
+        if e.kind == "rate_limit":
+            return self._t("ghparser.err_rate_limit", msg=msg)
+        if e.kind == "auth":
+            return self._t("ghparser.err_auth", msg=msg)
+        if e.kind == "network":
+            return self._t("ghparser.err_network", msg=msg)
+        return self._t("ghparser.err_default", msg=msg)

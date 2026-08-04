@@ -1,13 +1,19 @@
-[project]
+﻿[project]
 name = "ErisPulse-GitHubParser"
-version = "2.0.1"
-description = "GitHub链接解析模块，自动解析仓库/Issue/PR信息，支持富文本降级与README预览"
+version = "3.0.0"
+description = "被动解析 GitHub 链接并渲染图片卡片（Takumi），文本自动降级"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { file = "LICENSE" }
 authors = [ { name = "wsu2059q", email = "wsu2059@qq.com" } ]
 
 dependencies = [
+    "ErisPulse>=2.5.0",
+]
+
+[project.optional-dependencies]
+image = [
+    "ErisPulse-Takumi",
 ]
 
 [project.urls]
@@ -15,3 +21,6 @@ dependencies = [
 
 [project.entry-points."erispulse.module"]
 "GitHubParser" = "ErisPulse_GitHubParser:Main"
+
+[tool.setuptools]
+packages = ["ErisPulse_GitHubParser"]
